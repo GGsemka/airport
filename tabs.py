@@ -2,10 +2,11 @@
 
 import sys
 import tkinter as tk
+from datetime import datetime
 from tkinter import messagebox, ttk
 
 from dialogs import AirlineDialog, FlightDialog, GateDialog
-from models import Airline, Flight, Gate
+from models import DATETIME_FORMAT, Airline, Flight, Gate
 
 
 class EntityTab(ttk.Frame):
@@ -20,6 +21,8 @@ class EntityTab(ttk.Frame):
     super().__init__(parent)
     self.app = app
     self.manager = app.manager
+    self._sort_key = None   # ключ колонки, по которой отсортировано
+    self._sort_desc = False
     self._build()
 
   # ----- построение интерфейса -----
@@ -32,6 +35,18 @@ class EntityTab(ttk.Frame):
     )
     self.btn_add = ttk.Button(toolbar, text="Добавить", command=self.add)
     self.btn_add.pack(side="right")
+
+    search = ttk.Frame(toolbar)
+    search.pack(side="right", padx=(0, 16))
+    ttk.Label(search, text="Поиск:").pack(side="left", padx=(0, 6))
+    self.search_var = tk.StringVar()
+    self.search_var.trace_add("write", lambda *_: self.refresh())
+    entry = ttk.Entry(search, textvariable=self.search_var, width=24)
+    entry.pack(side="left")
+    entry.bind("<Escape>", lambda _e: self.search_var.set(""))
+    ttk.Button(
+        search, text="Сбросить", command=lambda: self.search_var.set("")
+    ).pack(side="left", padx=(8, 0))
 
     self.footer = ttk.Label(self, text="", style="Footer.TLabel")
     self.footer.pack(side="bottom", anchor="w", padx=12, pady=(4, 8))
@@ -48,7 +63,9 @@ class EntityTab(ttk.Frame):
         selectmode="browse",
     )
     for key, heading, width, anchor in self.columns:
-      self.tree.heading(key, text=heading)
+      self.tree.heading(
+          key, text=heading, command=lambda k=key: self.sort_by(k)
+      )
       self.tree.column(key, width=width, minwidth=40, anchor=anchor)
     yscroll = ttk.Scrollbar(box, orient="vertical", command=self.tree.yview)
     xscroll = ttk.Scrollbar(box, orient="horizontal", command=self.tree.xview)
@@ -97,6 +114,44 @@ class EntityTab(ttk.Frame):
   def row_values(self, obj):
     raise NotImplementedError
 
+  def sort_values(self, obj):
+    """Значения для сортировки (по колонкам); числа и даты — не строками."""
+    return self.row_values(obj)
+
+  def footer_text(self, shown, total):
+    if self.search_var.get().strip():
+      return f"Найдено: {shown} из {total}"
+    return ""
+
+  def sort_by(self, key):
+    """Клик по заголовку: по возрастанию, повторный клик — по убыванию."""
+    if self._sort_key == key:
+      self._sort_desc = not self._sort_desc
+    else:
+      self._sort_key, self._sort_desc = key, False
+    for col_key, heading, _width, _anchor in self.columns:
+      text = heading
+      if col_key == self._sort_key:
+        text += " ▼" if self._sort_desc else " ▲"
+      self.tree.heading(col_key, text=text)
+    self.refresh()
+
+  def _matches(self, obj, query):
+    if not query:
+      return True
+    return any(query in str(v).casefold() for v in self.row_values(obj))
+
+  def _sorted(self, objs):
+    if self._sort_key is None:
+      return objs
+    index = [c[0] for c in self.columns].index(self._sort_key)
+
+    def key(obj):
+      value = self.sort_values(obj)[index]
+      return value.casefold() if isinstance(value, str) else value
+
+    return sorted(objs, key=key, reverse=self._sort_desc)
+
   def selected_object(self):
     selection = self.tree.selection()
     if not selection:
@@ -112,9 +167,14 @@ class EntityTab(ttk.Frame):
       current = self.tree.selection()
       keep = int(current[0]) if current else None
 
+    query = self.search_var.get().strip().casefold()
+    all_items = self.items()
+    shown = self._sorted([o for o in all_items if self._matches(o, query)])
+
     self.tree.delete(*self.tree.get_children())
-    for obj in self.items():
+    for obj in shown:
       self.tree.insert("", "end", iid=str(obj.id), values=self.row_values(obj))
+    self.footer.config(text=self.footer_text(len(shown), len(all_items)))
     if keep is not None and self.tree.exists(str(keep)):
       self.tree.selection_set(str(keep))
       self.tree.focus(str(keep))
@@ -288,15 +348,38 @@ class FlightsTab(EntityTab):
         f"{deviation:+.1f}%" if abs(deviation) >= 0.05 else "0.0%",
     )
 
+  def sort_values(self, f):
+    load = self.manager.calculate_gate_load(f)
+    try:
+      when = datetime.strptime(f.departure_time, DATETIME_FORMAT)
+    except ValueError:
+      when = datetime.min
+    return (
+        f.id,
+        f.airline.name if f.airline else "",
+        f.flight_number,
+        str(f.gate) if f.gate else "",
+        f.destination,
+        when,
+        f.status,
+        f.passengers,
+        load,
+        load - self._average,
+    )
+
+  def footer_text(self, shown, total):
+    parts = []
+    if self.manager.flights:
+      parts.append(f"Средняя загрузка гейтов: {self._average:.1f}%")
+    base = super().footer_text(shown, total)
+    if base:
+      parts.append(base)
+    return "   |   ".join(parts)
+
   def refresh(self, select=None):
+    # среднее считается по всем рейсам, независимо от фильтра поиска
     self._average = self.manager.calculate_average_load()
     super().refresh(select)
-    if self.manager.flights:
-      self.footer.config(
-          text=f"Средняя загрузка гейтов: {self._average:.1f}%"
-      )
-    else:
-      self.footer.config(text="")
 
   def add(self):
     if not self.app.is_authorized:
